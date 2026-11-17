@@ -1,0 +1,23 @@
+# Dependencies
+node_modules/
+.pnpm-store/
+
+# Environment files
+.env
+.env.local
+.env.*.local
+
+# Build outputs
+dist/
+build/
+*.log
+
+# Docker volume mounts (if mounted locally)
+postgres_data/
+minio_data/
+
+# OS and IDE files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

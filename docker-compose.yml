@@ -1,0 +1,273 @@
+# CampusHub Multi-Container Architecture
+# Strict Network Segmentation: frontend, backend, data
+
+networks:
+  frontend:
+    driver: bridge
+  backend:
+    driver: bridge
+  data:
+    driver: bridge
+
+volumes:
+  postgres_data:
+    driver: local
+  minio_data:
+    driver: local
+
+services:
+  # -------------------------------------------------------------
+  # 1. GATEWAY: Only publicly exposed ingress entry point
+  # -------------------------------------------------------------
+  gateway:
+    build:
+      context: ./gateway
+      dockerfile: Dockerfile
+    image: campushub-gateway:latest
+    container_name: campushub-gateway
+    restart: unless-stopped
+    ports:
+      # Only gateway is published on all host interfaces
+      - "${GATEWAY_PORT:-80}:8080"
+    networks:
+      - frontend
+      - backend
+      - data
+    depends_on:
+      frontend:
+        condition: service_healthy
+      api:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          cpus: '0.50'
+          memory: 256M
+
+  # -------------------------------------------------------------
+  # 2. FRONTEND: React + Vite static bundle served via unprivileged Nginx
+  # -------------------------------------------------------------
+  frontend:
+    build:
+      context: ./app/frontend
+      dockerfile: Dockerfile
+    image: campushub-frontend:latest
+    container_name: campushub-frontend
+    restart: unless-stopped
+    networks:
+      - frontend
+    deploy:
+      resources:
+        limits:
+          cpus: '0.50'
+          memory: 256M
+
+  # -------------------------------------------------------------
+  # 3. API: Node.js / Express backend service
+  # -------------------------------------------------------------
+  api:
+    build:
+      context: ./app/api
+      dockerfile: Dockerfile
+    image: campushub-api:latest
+    container_name: campushub-api
+    restart: unless-stopped
+    environment:
+      NODE_ENV: ${NODE_ENV:-production}
+      PORT: ${PORT:-3000}
+      DB_HOST: ${DB_HOST:-postgres}
+      POSTGRES_PORT: ${POSTGRES_PORT:-5432}
+      POSTGRES_DB: ${POSTGRES_DB:-campushub}
+      POSTGRES_USER: ${POSTGRES_USER:-campushub_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-campushub_dev_password}
+      REDIS_HOST: ${REDIS_HOST:-redis}
+      REDIS_PORT: ${REDIS_PORT:-6379}
+      RABBITMQ_HOST: ${RABBITMQ_HOST:-rabbitmq}
+      RABBITMQ_PORT: ${RABBITMQ_PORT:-5672}
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_DEFAULT_USER:-campushub_admin}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_DEFAULT_PASS:-campushub_mq_secret}
+      RABBITMQ_QUEUE: ${RABBITMQ_QUEUE:-campushub_registrations}
+      MINIO_ENDPOINT: ${MINIO_ENDPOINT:-minio}
+      MINIO_PORT: ${MINIO_PORT:-9000}
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-campushub_minio}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-campushub_storage_secret}
+      MINIO_BUCKET: ${MINIO_BUCKET:-campushub}
+    networks:
+      - backend
+      - data
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          cpus: '0.75'
+          memory: 384M
+
+  # -------------------------------------------------------------
+  # 4. WORKER: Reuses API image, consumes RabbitMQ, sends email via MailHog
+  # -------------------------------------------------------------
+  worker:
+    image: campushub-api:latest
+    container_name: campushub-worker
+    restart: unless-stopped
+    command: ["npm", "run", "start:worker"]
+    # Worker must not inherit unsuitable API HTTP healthcheck
+    healthcheck:
+      disable: true
+    environment:
+      NODE_ENV: ${NODE_ENV:-production}
+      RABBITMQ_HOST: ${RABBITMQ_HOST:-rabbitmq}
+      RABBITMQ_PORT: ${RABBITMQ_PORT:-5672}
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_DEFAULT_USER:-campushub_admin}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_DEFAULT_PASS:-campushub_mq_secret}
+      RABBITMQ_QUEUE: ${RABBITMQ_QUEUE:-campushub_registrations}
+      MAIL_HOST: ${MAIL_HOST:-mailhog}
+      MAIL_PORT: ${MAIL_PORT:-1025}
+      MAIL_FROM: ${MAIL_FROM:-noreply@campushub.edu}
+    networks:
+      - backend
+      - data
+    depends_on:
+      api:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      mailhog:
+        condition: service_started
+    deploy:
+      resources:
+        limits:
+          cpus: '0.50'
+          memory: 256M
+
+  # -------------------------------------------------------------
+  # 5. POSTGRES: Relational database for events and registrations
+  # -------------------------------------------------------------
+  postgres:
+    image: postgres:16-alpine
+    container_name: campushub-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-campushub}
+      POSTGRES_USER: ${POSTGRES_USER:-campushub_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-campushub_dev_password}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-campushub_user} -d ${POSTGRES_DB:-campushub}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          cpus: '0.75'
+          memory: 512M
+
+  # -------------------------------------------------------------
+  # 6. REDIS: In-memory cache for event listings
+  # -------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    container_name: campushub-redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    networks:
+      - data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    deploy:
+      resources:
+        limits:
+          cpus: '0.50'
+          memory: 256M
+
+  # -------------------------------------------------------------
+  # 7. RABBITMQ: Message broker for asynchronous job queuing
+  # -------------------------------------------------------------
+  rabbitmq:
+    image: rabbitmq:3-management-alpine
+    container_name: campushub-rabbitmq
+    restart: unless-stopped
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_DEFAULT_USER:-campushub_admin}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_DEFAULT_PASS:-campushub_mq_secret}
+    ports:
+      # Management UI bound exclusively to localhost for debugging
+      - "127.0.0.1:${RABBITMQ_UI_PORT:-15672}:15672"
+    networks:
+      - data
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 10s
+      retries: 5
+      start_period: 20s
+    deploy:
+      resources:
+        limits:
+          cpus: '0.75'
+          memory: 512M
+
+  # -------------------------------------------------------------
+  # 8. MINIO: S3-compatible object store for event banner images
+  # -------------------------------------------------------------
+  minio:
+    image: minio/minio:latest
+    container_name: campushub-minio
+    restart: unless-stopped
+    user: "0:0"
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-campushub_minio}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-campushub_storage_secret}
+    ports:
+      # Console UI bound exclusively to localhost for inspection
+      - "127.0.0.1:${MINIO_CONSOLE_PORT:-9001}:9001"
+    volumes:
+      - minio_data:/data
+    networks:
+      - data
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://127.0.0.1:9000/minio/health/live || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          cpus: '0.75'
+          memory: 512M
+
+  # -------------------------------------------------------------
+  # 9. MAILHOG: Simulated SMTP server & Webmail UI
+  # -------------------------------------------------------------
+  mailhog:
+    image: mailhog/mailhog:latest
+    container_name: campushub-mailhog
+    restart: unless-stopped
+    ports:
+      # MailHog Webmail UI bound exclusively to localhost
+      - "127.0.0.1:${MAILHOG_UI_PORT:-8025}:8025"
+    networks:
+      - backend
+    deploy:
+      resources:
+        limits:
+          cpus: '0.50'
+          memory: 256M
